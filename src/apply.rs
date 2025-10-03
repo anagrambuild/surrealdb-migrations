@@ -14,7 +14,7 @@ use lexicmp::natural_lexical_cmp;
 use sha2::{Digest, Sha256};
 use std::{
     cmp::Ordering,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -32,7 +32,8 @@ use crate::{
     },
     models::{ApplyOperation, MigrationDirection, SchemaMigrationDefinition, ScriptMigration},
     surrealdb::{
-        self, TransactionAction, get_surrealdb_table_definition, is_define_checksum_statement,
+        self, TransactionAction, filter_define_statements_needed, get_surrealdb_table_definition,
+        get_surrealdb_table_exists, is_define_checksum_statement,
     },
     validate_checksum::{self, ValidateChecksumArgs},
     validate_version_order::{self, ValidateVersionOrderArgs},
@@ -442,7 +443,6 @@ async fn apply_migrations<C: Connection>(
                 get_initial_definition(config_file, definitions_path.to_path_buf(), embedded_dir)
             }
         }?;
-
         if !has_migration_files_to_execute {
             let schemas_statements = current_definition.schemas.to_string();
             let events_statements = current_definition.events.to_string();
@@ -461,13 +461,55 @@ async fn apply_migrations<C: Connection>(
             let schemas_statements = surrealdb::parse_statements(&schemas_statements)?;
             let events_statements = surrealdb::parse_statements(&events_statements)?;
 
-            let statements = schemas_statements
-                .into_iter()
-                .chain(events_statements.into_iter())
-                .collect::<Vec<_>>();
+            let statement_groups = group_define_statements_by_table(
+                schemas_statements
+                    .into_iter()
+                    .chain(events_statements.into_iter())
+                    .collect::<Vec<_>>(),
+            );
 
             let transaction_action = get_transaction_action(dry_run);
-            surrealdb::apply_in_transaction(client, statements, transaction_action).await?;
+            for group in statement_groups.into_iter() {
+                if !group.is_empty() {
+                    if display_logs {
+                        if let Some(table) = get_group_table_name(&group) {
+                            println!("Table {}: evaluating DEFINE changes...", table);
+                        } else {
+                            println!("Non-table statements: evaluating DEFINE changes...");
+                        }
+                    }
+                    // Avoid applying no-op DEFINEs: filter against current DB metadata
+                    let filtered = filter_define_statements_needed(client, group).await?;
+                    if !filtered.is_empty() {
+                        if display_logs {
+                            if let Some(table) = get_group_table_name(&filtered) {
+                                println!(
+                                    "Table {}: applying {} DEFINE statements...",
+                                    table,
+                                    filtered.len()
+                                );
+                            } else {
+                                println!("Applying {} DEFINE statements...", filtered.len());
+                            }
+                        }
+                        // Chunk filtered statements to reduce long single-transaction runtimes
+                        let mut start = 0usize;
+                        while start < filtered.len() {
+                            let end = std::cmp::min(start + 50, filtered.len());
+                            let chunk = filtered[start..end].to_vec();
+                            surrealdb::apply_in_transaction(client, chunk, transaction_action)
+                                .await?;
+                            start = end;
+                        }
+                    } else if display_logs {
+                        if let Some(table) = get_group_table_name(&filtered) {
+                            println!("Table {}: no changes needed.", table);
+                        } else {
+                            println!("Non-table statements: no changes needed.");
+                        }
+                    }
+                }
+            }
 
             if !current_definition.schemas.is_empty() {
                 has_applied_schemas = true;
@@ -478,11 +520,7 @@ async fn apply_migrations<C: Connection>(
         }
     }
 
-    let script_migration_table_definition =
-        get_surrealdb_table_definition(client, SCRIPT_MIGRATION_TABLE_NAME).await?;
-    let mut supports_checksum = script_migration_table_definition
-        .fields
-        .contains_key("checksum");
+    let mut supports_checksum = false;
 
     for migration_file in &migration_files_to_execute {
         let mut schemas_statements = String::new();
@@ -552,6 +590,15 @@ CREATE {} SET script_name = '{}';",
             || migration_statements
                 .iter()
                 .any(is_define_checksum_statement);
+        if !supports_checksum {
+            if get_surrealdb_table_exists(client, SCRIPT_MIGRATION_TABLE_NAME).await? {
+                let script_migration_table_definition =
+                    get_surrealdb_table_definition(client, SCRIPT_MIGRATION_TABLE_NAME).await?;
+                supports_checksum = script_migration_table_definition
+                    .fields
+                    .contains_key("checksum");
+            }
+        }
 
         let mut what = ::surrealdb::sql::Values::default();
         what.0.push(::surrealdb::sql::Value::Table(
@@ -580,20 +627,65 @@ CREATE {} SET script_name = '{}';",
         ));
         create_migration_script_statement.output = Some(::surrealdb::sql::Output::None);
 
-        let statements = schemas_statements
-            .into_iter()
-            .chain(events_statements.into_iter())
-            .chain(migration_statements.into_iter())
-            .chain(
-                vec![::surrealdb::sql::Statement::Create(
-                    create_migration_script_statement,
-                )]
-                .into_iter(),
-            )
-            .collect::<Vec<_>>();
+        let define_statement_groups = group_define_statements_by_table(
+            schemas_statements
+                .into_iter()
+                .chain(events_statements.into_iter())
+                .collect::<Vec<_>>(),
+        );
 
         let transaction_action = get_transaction_action(dry_run);
-        surrealdb::apply_in_transaction(client, statements, transaction_action).await?;
+
+        for group in define_statement_groups.into_iter() {
+            if !group.is_empty() {
+                if display_logs {
+                    if let Some(table) = get_group_table_name(&group) {
+                        println!("Table {}: evaluating DEFINE changes...", table);
+                    } else {
+                        println!("Non-table statements: evaluating DEFINE changes...");
+                    }
+                }
+                // Avoid applying no-op DEFINEs: filter against current DB metadata
+                let filtered = filter_define_statements_needed(client, group).await?;
+                if !filtered.is_empty() {
+                    if display_logs {
+                        if let Some(table) = get_group_table_name(&filtered) {
+                            println!(
+                                "Table {}: applying {} DEFINE statements...",
+                                table,
+                                filtered.len()
+                            );
+                        } else {
+                            println!("Applying {} DEFINE statements...", filtered.len());
+                        }
+                    }
+                    // Chunk filtered statements to reduce long single-transaction runtimes
+                    let mut start = 0usize;
+                    while start < filtered.len() {
+                        let end = std::cmp::min(start + 50, filtered.len());
+                        let chunk = filtered[start..end].to_vec();
+                        surrealdb::apply_in_transaction(client, chunk, transaction_action).await?;
+                        start = end;
+                    }
+                } else if display_logs {
+                    if let Some(table) = get_group_table_name(&filtered) {
+                        println!("Table {}: no changes needed.", table);
+                    } else {
+                        println!("Non-table statements: no changes needed.");
+                    }
+                }
+            }
+        }
+
+        let migration_txn_statements = vec![::surrealdb::sql::Statement::Create(
+            create_migration_script_statement,
+        )]
+        .into_iter()
+        .chain(migration_statements.into_iter())
+        .collect::<Vec<_>>();
+
+        surrealdb::apply_in_transaction(client, migration_txn_statements, transaction_action)
+            .await?;
 
         if use_migration_definitions {
             if !current_definition.schemas.is_empty() {
@@ -948,4 +1040,103 @@ fn extract_define_event_statements(statements: Vec<Statement>) -> Vec<DefineEven
             _ => None,
         })
         .collect::<Vec<_>>()
+}
+
+fn group_define_statements_by_table(statements: Vec<Statement>) -> Vec<Vec<Statement>> {
+    let mut grouped: HashMap<
+        String,
+        (
+            Vec<Statement>,
+            Vec<Statement>,
+            Vec<Statement>,
+            Vec<Statement>,
+        ),
+    > = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    let mut others: Vec<Statement> = Vec::new();
+
+    for statement in statements.into_iter() {
+        match statement {
+            Statement::Define(DefineStatement::Table(t)) => {
+                let key = t.name.0.clone();
+                let entry = grouped
+                    .entry(key.clone())
+                    .or_insert_with(|| (Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+                entry.0.push(Statement::Define(DefineStatement::Table(t)));
+                if !order.contains(&key) {
+                    order.push(key);
+                }
+            }
+            Statement::Define(DefineStatement::Field(f)) => {
+                let key = f.what.to_string();
+                let entry = grouped
+                    .entry(key.clone())
+                    .or_insert_with(|| (Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+                entry.1.push(Statement::Define(DefineStatement::Field(f)));
+                if !order.contains(&key) {
+                    order.push(key);
+                }
+            }
+            Statement::Define(DefineStatement::Event(e)) => {
+                let key = e.what.to_string();
+                let entry = grouped
+                    .entry(key.clone())
+                    .or_insert_with(|| (Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+                entry.2.push(Statement::Define(DefineStatement::Event(e)));
+                if !order.contains(&key) {
+                    order.push(key);
+                }
+            }
+            Statement::Define(DefineStatement::Index(i)) => {
+                let key = i.what.to_string();
+                let entry = grouped
+                    .entry(key.clone())
+                    .or_insert_with(|| (Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+                entry.3.push(Statement::Define(DefineStatement::Index(i)));
+                if !order.contains(&key) {
+                    order.push(key);
+                }
+            }
+            other => others.push(other),
+        }
+    }
+
+    let mut results: Vec<Vec<Statement>> = Vec::new();
+    for key in order.into_iter() {
+        if let Some((mut tables, mut fields, mut events, mut indexes)) = grouped.remove(&key) {
+            let mut group: Vec<Statement> = Vec::new();
+            group.append(&mut tables);
+            group.append(&mut fields);
+            group.append(&mut events);
+            group.append(&mut indexes);
+            results.push(group);
+        }
+    }
+
+    if !others.is_empty() {
+        results.push(others);
+    }
+
+    results
+}
+
+fn get_group_table_name(group: &[Statement]) -> Option<String> {
+    for statement in group {
+        match statement {
+            Statement::Define(DefineStatement::Table(t)) => {
+                return Some(t.name.0.clone());
+            }
+            Statement::Define(DefineStatement::Field(f)) => {
+                return Some(f.what.to_string());
+            }
+            Statement::Define(DefineStatement::Event(e)) => {
+                return Some(e.what.to_string());
+            }
+            Statement::Define(DefineStatement::Index(i)) => {
+                return Some(i.what.to_string());
+            }
+            _ => {}
+        }
+    }
+    None
 }

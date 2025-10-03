@@ -1,4 +1,3 @@
-use ::surrealdb::sql::{statements::DefineStatement, Query, Statement};
 use color_eyre::eyre::{eyre, ContextCompat, Result, WrapErr};
 use fs_extra::dir::{DirEntryAttr, DirEntryValue};
 use include_dir::Dir;
@@ -9,6 +8,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
+use surrealdb::sql::{statements::DefineStatement, Query, Statement};
 
 use crate::{
     config,
@@ -417,8 +417,23 @@ fn nested_extract_surql_files_from_filesystem(
 
                         let path: String = path.clone();
 
+                        // Derive a normalized file name (file stem), consistent with embedded mode
+                        let mut name_normalized = Path::new(name)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(name)
+                            .to_string();
+                        if name_normalized.ends_with(".down") {
+                            if let Some(stem2) = Path::new(&name_normalized)
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                            {
+                                name_normalized = stem2.to_string();
+                            }
+                        }
+
                         vec![SurqlFile {
-                            name: name.to_string(),
+                            name: name_normalized,
                             full_name: full_name.to_string(),
                             tags,
                             content: Box::new(move || fs_extra::file::read_to_string(&path).ok()),

@@ -1,4 +1,4 @@
-use color_eyre::eyre::{eyre, ContextCompat, Result};
+use color_eyre::eyre::{ContextCompat, Result, eyre};
 use itertools::Itertools;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -59,6 +59,37 @@ pub async fn get_surrealdb_table_definition<C: Connection>(
     Ok(table_definition)
 }
 
+#[derive(Debug, Deserialize)]
+struct SurrealdbInfoForTableResponse {
+    events: HashMap<String, String>,
+    fields: HashMap<String, String>,
+    tables: HashMap<String, String>,
+    indexes: HashMap<String, String>,
+}
+
+pub async fn get_surrealdb_table_indexes<C: Connection>(
+    client: &Surreal<C>,
+    table: &str,
+) -> Result<std::collections::HashSet<String>> {
+    let response = client
+        .query(surrealdb::sql::statements::InfoStatement::Tb(
+            table.into(),
+            false,
+            None,
+        ))
+        .await?;
+
+    let mut response = response.check()?;
+
+    let result: Option<SurrealdbInfoForTableResponse> = response.take(0)?;
+    let table_info = result.context(format!(
+        "Failed to get table info for table '{}'",
+        table
+    ))?;
+
+    Ok(std::collections::HashSet::from_iter(table_info.indexes.keys().cloned()))
+}
+
 pub async fn list_script_migration_ordered_by_execution_date<C: Connection>(
     client: &Surreal<C>,
 ) -> Result<Vec<ScriptMigration>> {
@@ -96,6 +127,108 @@ pub fn is_define_checksum_statement(statement: &surrealdb::sql::Statement) -> bo
         }
         _ => false,
     }
+}
+
+/// Filter out DEFINE statements that are already satisfied in the database using INFO metadata.
+/// This avoids executing schema operations on large tables when the schema is already in sync.
+pub async fn filter_define_statements_needed<C: Connection>(
+    client: &Surreal<C>,
+    statements: Vec<surrealdb::sql::Statement>,
+) -> Result<Vec<surrealdb::sql::Statement>> {
+    // Collect referenced table names from the incoming statements
+    let mut referenced_tables: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for s in statements.iter() {
+        match s {
+            surrealdb::sql::Statement::Define(surrealdb::sql::statements::DefineStatement::Table(t)) => {
+                referenced_tables.insert(t.name.0.clone());
+            }
+            surrealdb::sql::Statement::Define(surrealdb::sql::statements::DefineStatement::Field(f)) => {
+                referenced_tables.insert(f.what.to_string());
+            }
+            surrealdb::sql::Statement::Define(surrealdb::sql::statements::DefineStatement::Event(e)) => {
+                referenced_tables.insert(e.what.to_string());
+            }
+            surrealdb::sql::Statement::Define(surrealdb::sql::statements::DefineStatement::Index(i)) => {
+                referenced_tables.insert(i.what.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    // Fetch existing tables map to check existence quickly (INFO FOR DB)
+    let existing_tables = get_surrealdb_table_definitions(client).await?;
+
+    // Fetch field and index definitions for referenced, existing tables only (INFO FOR TABLE)
+    let mut table_field_defs: std::collections::HashMap<String, SurrealdbTableDefinition> =
+        std::collections::HashMap::new();
+    let mut table_index_names: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for table_name in referenced_tables.into_iter() {
+        if existing_tables.contains_key(&table_name) {
+            if let Ok(def) = get_surrealdb_table_definition(client, &table_name).await {
+                table_field_defs.insert(table_name.clone(), def);
+            }
+            if let Ok(indexes) = get_surrealdb_table_indexes(client, &table_name).await {
+                table_index_names.insert(table_name, indexes);
+            }
+        }
+    }
+
+    // Keep only statements that would change the current schema
+    let mut needed: Vec<surrealdb::sql::Statement> = Vec::new();
+    for s in statements.into_iter() {
+        match s {
+            // Create table only if table does not yet exist
+            surrealdb::sql::Statement::Define(
+                surrealdb::sql::statements::DefineStatement::Table(ref t),
+            ) => {
+                let table_name = t.name.0.clone();
+                if !existing_tables.contains_key(&table_name) {
+                    needed.push(s);
+                }
+            }
+            // Create field only if the field does not yet exist in the table
+            surrealdb::sql::Statement::Define(
+                surrealdb::sql::statements::DefineStatement::Field(ref f),
+            ) => {
+                let table_name = f.what.to_string();
+                let field_name = f.name.to_string();
+                match table_field_defs.get(&table_name) {
+                    Some(def) => {
+                        if !def.fields.contains_key(&field_name) {
+                            needed.push(s);
+                        }
+                    }
+                    // If table does not exist in cache (either truly missing or INFO failed),
+                    // keep the statement to ensure convergence.
+                    None => needed.push(s),
+                }
+            }
+            // Keep events as-is (INFO diffing for events not implemented here)
+            surrealdb::sql::Statement::Define(
+                surrealdb::sql::statements::DefineStatement::Event(_),
+            ) => needed.push(s),
+            // Create index only if an index with the same name does not already exist on the table
+            surrealdb::sql::Statement::Define(
+                surrealdb::sql::statements::DefineStatement::Index(ref i),
+            ) => {
+                let table_name = i.what.to_string();
+                let index_name = i.name.to_string();
+                match table_index_names.get(&table_name) {
+                    Some(existing) => {
+                        if !existing.contains(&index_name) {
+                            needed.push(s);
+                        }
+                    }
+                    None => needed.push(s),
+                }
+            }
+            // Pass through all other statements unchanged
+            _ => needed.push(s),
+        }
+    }
+
+    Ok(needed)
 }
 
 pub async fn apply_in_transaction<C: Connection>(
@@ -174,7 +307,7 @@ pub async fn apply_in_transaction<C: Connection>(
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum TransactionAction {
     Commit,
     Rollback,
